@@ -1,0 +1,401 @@
+#include "stm32f4xx.h"
+
+void timer2_delay_ms(int ms);
+
+/* ================================================================
+ * COLOUR MACROS  (RGB565 big-endian)
+ * ================================================================ */
+#define COL_SKY     0x0011
+#define COL_GLOW    0x0210
+#define COL_GROUND  0x2945
+#define COL_CITY    0x2104
+#define COL_WIN     0xFFE0
+#define COL_STAR    0xFFFF
+#define COL_STAR2   0xC618
+#define COL_ARM     0x8410
+#define COL_BODY1   0xC000
+#define COL_BODY2   0xF800
+#define COL_BODY3   0xFB00
+#define COL_PROP1   0x07E0
+#define COL_PROP2   0xFFE0
+#define COL_LED_A   0x07FF
+#define COL_LED_B   0xF81F
+#define COL_CAM     0x5AEB
+#define COL_TRAIL1  0xFD20
+#define COL_TRAIL2  0xFC00
+#define COL_WHITE   0xFFFF
+
+#define LCD_W  240
+#define LCD_H  320
+
+/* ================================================================
+ * SPI5 / ILI9341 PIN CONTROL
+ *   PF7=SCK  PF8=MISO  PF9=MOSI  (AF5)
+ *   PC2=CS   PD13=DCX  PD12=RST  (GPIO output)
+ * ================================================================ */
+#define CS_LOW()   (GPIOC->BSRR = (1u<<(2+16)))
+#define CS_HIGH()  (GPIOC->BSRR = (1u<< 2))
+#define DCX_CMD()  (GPIOD->BSRR = (1u<<(13+16)))
+#define DCX_DATA() (GPIOD->BSRR = (1u<< 13))
+#define RST_LOW()  (GPIOD->BSRR = (1u<<(12+16)))
+#define RST_HIGH() (GPIOD->BSRR = (1u<< 12))
+
+/* ================================================================
+ * FRAMEBUFFER  240x320x2 = 153 600 bytes
+ * ================================================================ */
+static uint16_t fb[LCD_H][LCD_W];
+
+/* ================================================================
+ * GRID POSITION  (volatile - shared between main loop and ISRs)
+ *   x = row    0..2   (0=top,  2=bottom)
+ *   y = column 0..2   (0=left, 2=right)
+ * ================================================================ */
+volatile int x = 0;
+volatile int y = 0;
+
+/* ================================================================
+ * SPI5 HELPERS
+ * ================================================================ */
+void spi5_send(uint8_t b) {
+    while (!(SPI5->SR & SPI_SR_TXE));
+    *(volatile uint8_t *)&SPI5->DR = b;
+    while (SPI5->SR & SPI_SR_BSY);
+}
+void ili_cmd(uint8_t cmd) { DCX_CMD();  CS_LOW(); spi5_send(cmd); CS_HIGH(); }
+void ili_data(uint8_t d)  { DCX_DATA(); CS_LOW(); spi5_send(d);   CS_HIGH(); }
+
+/* ================================================================
+ * ILI9341 INIT
+ * ================================================================ */
+void ili9341_init(void) {
+    RST_LOW();  timer2_delay_ms(10);
+    RST_HIGH(); timer2_delay_ms(120);
+    ili_cmd(0x01); timer2_delay_ms(5);
+    ili_cmd(0x28);
+    ili_cmd(0xCF); ili_data(0x00); ili_data(0x83); ili_data(0x30);
+    ili_cmd(0xED); ili_data(0x64); ili_data(0x03); ili_data(0x12); ili_data(0x81);
+    ili_cmd(0xE8); ili_data(0x85); ili_data(0x01); ili_data(0x79);
+    ili_cmd(0xCB); ili_data(0x39); ili_data(0x2C); ili_data(0x00); ili_data(0x34); ili_data(0x02);
+    ili_cmd(0xF7); ili_data(0x20);
+    ili_cmd(0xEA); ili_data(0x00); ili_data(0x00);
+    ili_cmd(0xC0); ili_data(0x26);
+    ili_cmd(0xC1); ili_data(0x11);
+    ili_cmd(0xC5); ili_data(0x35); ili_data(0x3E);
+    ili_cmd(0xC7); ili_data(0xBE);
+    ili_cmd(0x36); ili_data(0x48);
+    ili_cmd(0x3A); ili_data(0x55);
+    ili_cmd(0xB1); ili_data(0x00); ili_data(0x1B);
+    ili_cmd(0xF2); ili_data(0x08);
+    ili_cmd(0x26); ili_data(0x01);
+    ili_cmd(0xE0);
+    ili_data(0x1F); ili_data(0x1A); ili_data(0x18); ili_data(0x0A);
+    ili_data(0x0F); ili_data(0x06); ili_data(0x45); ili_data(0x87);
+    ili_data(0x32); ili_data(0x0A); ili_data(0x07); ili_data(0x02);
+    ili_data(0x07); ili_data(0x05); ili_data(0x00);
+    ili_cmd(0xE1);
+    ili_data(0x00); ili_data(0x25); ili_data(0x27); ili_data(0x05);
+    ili_data(0x10); ili_data(0x09); ili_data(0x3A); ili_data(0x78);
+    ili_data(0x4D); ili_data(0x05); ili_data(0x18); ili_data(0x0D);
+    ili_data(0x38); ili_data(0x3A); ili_data(0x1F);
+    ili_cmd(0x11); timer2_delay_ms(120);
+    ili_cmd(0x29);
+}
+
+/* ================================================================
+ * FLUSH FRAMEBUFFER -> LCD
+ * ================================================================ */
+void lcd_flush(void) {
+    ili_cmd(0x2A);
+    ili_data(0x00); ili_data(0x00); ili_data(0x00); ili_data(0xEF);
+    ili_cmd(0x2B);
+    ili_data(0x00); ili_data(0x00); ili_data(0x01); ili_data(0x3F);
+    ili_cmd(0x2C);
+    DCX_DATA(); CS_LOW();
+    for (int r = 0; r < LCD_H; r++) {
+        for (int c = 0; c < LCD_W; c++) {
+            uint16_t p = fb[r][c];
+            while (!(SPI5->SR & SPI_SR_TXE));
+            *(volatile uint8_t *)&SPI5->DR = (uint8_t)(p >> 8);
+            while (!(SPI5->SR & SPI_SR_TXE));
+            *(volatile uint8_t *)&SPI5->DR = (uint8_t)(p & 0xFF);
+        }
+    }
+    while (SPI5->SR & SPI_SR_BSY);
+    CS_HIGH();
+}
+
+/* ================================================================
+ * FRAMEBUFFER PRIMITIVES
+ * ================================================================ */
+void fb_pixel(int x, int y, uint16_t col) {
+    if ((unsigned)x < LCD_W && (unsigned)y < LCD_H) fb[y][x] = col;
+}
+void fb_rect(int x, int y, int w, int h, uint16_t col) {
+    for (int r = y; r < y+h; r++)
+        for (int c = x; c < x+w; c++)
+            fb_pixel(c, r, col);
+}
+void fb_circle(int cx, int cy, int r, uint16_t col) {
+    for (int dy = -r; dy <= r; dy++)
+        for (int dx = -r; dx <= r; dx++)
+            if (dx*dx + dy*dy <= r*r) fb_pixel(cx+dx, cy+dy, col);
+}
+void fb_line(int x0, int y0, int x1, int y1, uint16_t col) {
+    int dx = x1-x0, dy = y1-y0;
+    int steps = (dx<0?-dx:dx)>(dy<0?-dy:dy) ? (dx<0?-dx:dx):(dy<0?-dy:dy);
+    if (!steps) { fb_pixel(x0,y0,col); return; }
+    for (int i = 0; i <= steps; i++) {
+        int px = x0+dx*i/steps, py = y0+dy*i/steps;
+        fb_pixel(px,   py,   col);
+        fb_pixel(px+1, py,   col);
+        fb_pixel(px,   py+1, col);
+    }
+}
+
+/* ================================================================
+ * STATIC SCENE DATA
+ * ================================================================ */
+static const uint8_t star_x[32] = {
+    12,28,45,67,80,101,115,130,150,170,185,200,218,230,8,
+    33,55,90,107,125,145,162,178,195,210,222,18,48,73,98,138,160
+};
+static const uint8_t star_y[32] = {
+    5,18,8,25,12,4,20,9,15,6,22,11,3,17,30,
+    35,28,42,38,50,45,60,55,70,65,48,80,75,90,85,95,100
+};
+static const uint8_t city_x[12] = {  0,18,35,55, 75, 95,115,135,155,175,195,215 };
+static const uint8_t city_w[12] = { 15,14,16,17, 18, 16, 14, 18, 17, 16, 15, 25 };
+static const uint8_t city_h[12] = { 60,45,70,50, 80, 55, 65, 48, 72, 40, 68, 55 };
+
+/* ================================================================
+ * DRAW STARS / CITY / GROUND
+ * ================================================================ */
+void draw_stars(int twinkle) {
+    for (int i = 0; i < 32; i++) {
+        uint16_t col = (twinkle & (1<<(i&15))) ? COL_STAR : COL_STAR2;
+        fb_pixel(star_x[i], star_y[i], col);
+    }
+}
+void draw_city(void) {
+    for (int i = 0; i < 12; i++) {
+        int top = LCD_H - city_h[i];
+        fb_rect(city_x[i], top, city_w[i], city_h[i], COL_CITY);
+        for (int wy = top+4; wy < LCD_H-6; wy += 7)
+            for (int wx = city_x[i]+2; wx < city_x[i]+city_w[i]-2; wx += 5)
+                fb_rect(wx, wy, 2, 2, COL_WIN);
+    }
+}
+void draw_ground(void) {
+    fb_rect(0, LCD_H-10, LCD_W, 10, COL_GROUND);
+}
+
+/* ================================================================
+ * DRAW DRONE     NO-FLASH version
+ *
+ * Why the old version flashed:
+ *   1. Single pixel trail pixels switched to COL_SKY every other
+ *      frame, making them blink on/off visibly.
+ *   2. Each propeller hub drew only ONE blade per frame (H or V),
+ *      so on alternate frames a blade was completely absent.
+ *
+ * Fix applied here:
+ *   - BOTH blades (horizontal + vertical) are drawn every frame at
+ *     every hub.  Only the draw order (which is on top) alternates.
+ *     This gives a colour-shift "spinning" look with zero strobe.
+ *   - Downwash trail uses solid 3x2 rects   always present.
+ *   - Both status LEDs always lit; only colour toggles.
+ *   - prop_rot incremented by 2 per frame in main loop = faster spin.
+ * ================================================================ */
+void draw_drone(int dx, int dy, int rot) {
+    /* Arms */
+    fb_line(dx-16, dy-16, dx-2, dy-2, COL_ARM);
+    fb_line(dx+16, dy-16, dx+2, dy-2, COL_ARM);
+    fb_line(dx-16, dy+16, dx-2, dy+2, COL_ARM);
+    fb_line(dx+16, dy+16, dx+2, dy+2, COL_ARM);
+
+    /* Propellers: both blades every frame, only top/bottom order swaps */
+    const int tip_ox[4] = { -18,  18, -18,  18 };
+    const int tip_oy[4] = { -18, -18,  18,  18 };
+    for (int q = 0; q < 4; q++) {
+        int px = dx + tip_ox[q];
+        int py = dy + tip_oy[q];
+        if ((rot + q) & 1) {
+            fb_rect(px-7, py-1, 14,  3, COL_PROP1); /* H blade  */
+            fb_rect(px-1, py-7,  3, 14, COL_PROP2); /* V on top */
+        } else {
+            fb_rect(px-1, py-7,  3, 14, COL_PROP2); /* V blade  */
+            fb_rect(px-7, py-1, 14,  3, COL_PROP1); /* H on top */
+        }
+        fb_circle(px, py, 3, COL_ARM);              /* hub      */
+    }
+
+    /* Body */
+    fb_rect(dx-5, dy-5, 10, 10, COL_BODY1);
+    fb_rect(dx-4, dy-4,  8,  8, COL_BODY2);
+    fb_rect(dx-2, dy-2,  4,  4, COL_BODY3);
+
+    /* Status LEDs: both always on, colours alternate */
+    fb_circle(dx-4, dy-8, 2, COL_LED_A);
+    fb_circle(dx+4, dy-8, 2, (rot & 1) ? COL_LED_B : COL_LED_A);
+
+    /* Camera gimbal */
+    fb_circle(dx, dy+6, 3, COL_CAM);
+    fb_pixel (dx, dy+6, COL_WHITE);
+
+    /* Downwash: solid rects, never disappear */
+    fb_rect(dx-1, dy+10, 3, 2, COL_TRAIL1);
+    fb_rect(dx-1, dy+14, 3, 2, COL_TRAIL1);
+    fb_rect(dx-1, dy+18, 3, 2, COL_TRAIL2);
+}
+
+/* ================================================================
+ * LED GRID UPDATE
+ * ================================================================ */
+void update_led(void) {
+    GPIOB->ODR &= ~((1<<0)|(1<<1)|(1<<2)|(1<<3)|(1<<5)|(1<<7)|(1<<9));
+    GPIOE->ODR &= ~((1<<1)|(1<<2));
+    int lx = x, ly = y;
+    if (lx==0&&ly==0) GPIOB->ODR |= (1<<5);
+    if (lx==0&&ly==1) GPIOB->ODR |= (1<<9);
+    if (lx==0&&ly==2) GPIOB->ODR |= (1<<3);
+    if (lx==1&&ly==0) GPIOB->ODR |= (1<<7);
+    if (lx==1&&ly==1) GPIOE->ODR |= (1<<1);
+    if (lx==1&&ly==2) GPIOB->ODR |= (1<<2);
+    if (lx==2&&ly==0) GPIOB->ODR |= (1<<0);
+    if (lx==2&&ly==1) GPIOE->ODR |= (1<<2);
+    if (lx==2&&ly==2) GPIOB->ODR |= (1<<1);
+}
+
+/* ================================================================
+ * MAIN
+ * ================================================================ */
+int main(void) {
+    __disable_irq();
+
+    /* Clocks */
+    RCC->AHB1ENR |= (1<<1)|(1<<2)|(1<<3)|(1<<4)|(1<<5); /* B C D E F */
+    RCC->APB1ENR |= (1<<0);   /* TIM2   */
+    RCC->APB2ENR |= (1<<20);  /* SPI5   */
+    RCC->APB2ENR |= (1<<14);  /* SYSCFG */
+
+    /* LED outputs: PB0,1,2,3,5,7,9  PE1,2 */
+    GPIOB->MODER &= ~((3<<0*2)|(3<<1*2)|(3<<2*2)|(3<<3*2)|(3<<5*2)|(3<<7*2)|(3<<9*2));
+    GPIOB->MODER |=  ((1<<0*2)|(1<<1*2)|(1<<2*2)|(1<<3*2)|(1<<5*2)|(1<<7*2)|(1<<9*2));
+    GPIOE->MODER &= ~((3<<1*2)|(3<<2*2));
+    GPIOE->MODER |=  ((1<<1*2)|(1<<2*2));
+
+    /* Button inputs pull-up: PB4,6,8,10,11,12,13  PE0 */
+    GPIOB->MODER &= ~((3<<4*2)|(3<<6*2)|(3<<8*2)|(3<<10*2)|(3<<11*2)|(3<<12*2)|(3<<13*2));
+    GPIOB->PUPDR |=  ((1<<4*2)|(1<<6*2)|(1<<8*2)|(1<<10*2)|(1<<11*2)|(1<<12*2)|(1<<13*2));
+    GPIOE->MODER &= ~(3<<0*2);
+    GPIOE->PUPDR |=  (1<<0*2);
+
+    /* SPI5 pins: PF7=SCK PF8=MISO PF9=MOSI -> AF5 */
+    GPIOF->MODER &= ~((3<<7*2)|(3<<8*2)|(3<<9*2));
+    GPIOF->MODER |=  ((2<<7*2)|(2<<8*2)|(2<<9*2));
+    GPIOF->AFR[0] |= (5<<7*4);
+    GPIOF->AFR[1] |= (5<<(8-8)*4)|(5<<(9-8)*4);
+    GPIOF->OSPEEDR |= (3<<7*2)|(3<<9*2);
+
+    /* CS=PC2  DCX=PD13  RST=PD12 -> GPIO output */
+    GPIOC->MODER &= ~(3<<2*2); GPIOC->MODER |= (1<<2*2);
+    GPIOD->MODER &= ~((3<<12*2)|(3<<13*2));
+    GPIOD->MODER |=  ((1<<12*2)|(1<<13*2));
+    CS_HIGH(); RST_HIGH();
+
+    /* SPI5: master, CPOL=0 CPHA=0, fPCLK/8, 8-bit */
+    SPI5->CR1 = SPI_CR1_MSTR | SPI_CR1_SSM | SPI_CR1_SSI | (2<<3);
+    SPI5->CR1 |= SPI_CR1_SPE;
+
+    /* EXTI button mapping */
+    SYSCFG->EXTICR[0] = 0; SYSCFG->EXTICR[1] = 0;
+    SYSCFG->EXTICR[2] = 0; SYSCFG->EXTICR[3] = 0;
+    SYSCFG->EXTICR[1] |= (0x1<<8);  /* PB6  -> EXTI6  */
+    SYSCFG->EXTICR[1] |= (0x1<<0);  /* PB4  -> EXTI4  */
+    SYSCFG->EXTICR[2] |= (0x1<<0);  /* PB8  -> EXTI8  */
+    SYSCFG->EXTICR[0] |= (0x4<<0);  /* PE0  -> EXTI0  */
+    SYSCFG->EXTICR[2] |= (0x1<<8);  /* PB10 -> EXTI10 */
+    SYSCFG->EXTICR[2] |= (0x1<<12); /* PB11 -> EXTI11 */
+    SYSCFG->EXTICR[3] |= (0x1<<0);  /* PB12 -> EXTI12 */
+    SYSCFG->EXTICR[3] |= (0x1<<4);  /* PB13 -> EXTI13 */
+    EXTI->IMR  |= (1<<6)|(1<<4)|(1<<8)|(1<<0)|(1<<10)|(1<<11)|(1<<12)|(1<<13);
+    EXTI->FTSR |= (1<<6)|(1<<4)|(1<<8)|(1<<0)|(1<<10)|(1<<11)|(1<<12)|(1<<13);
+    NVIC_EnableIRQ(EXTI9_5_IRQn);
+    NVIC_EnableIRQ(EXTI4_IRQn);
+    NVIC_EnableIRQ(EXTI0_IRQn);
+    NVIC_EnableIRQ(EXTI15_10_IRQn);
+
+    __enable_irq();
+    ili9341_init();
+    update_led();
+
+    /* ================================================================
+     * 3x3 grid -> fixed LCD pixel centres
+     *   y (column) -> drone LCD-X:  0=40   1=120  2=200
+     *   x (row)    -> drone LCD-Y:  0=60   1=160  2=260
+     * ================================================================ */
+    const int grid_lcd_x[3] = { 40, 120, 200 };
+    const int grid_lcd_y[3] = { 60, 160, 260 };
+
+    int prop_rot = 0;
+    int frame    = 0;
+    int twinkle  = 0xA5A5;
+
+    while (1) {
+        /* Advance propeller by 2 every frame -> fast visible spin */
+        prop_rot = (prop_rot + 2) & 3;
+        frame++;
+        if ((frame & 7) == 0) twinkle ^= 0x6C9A;
+
+        /* Snap drone directly to current grid cell, no interpolation */
+        int drone_x = grid_lcd_x[y];
+        int drone_y = grid_lcd_y[x];
+
+        /* Draw scene */
+        fb_rect(0,   0,   LCD_W, 110,       COL_SKY);
+        fb_rect(0, 110,   LCD_W, LCD_H-120, COL_GLOW);
+        draw_stars(twinkle);
+        draw_city();
+        draw_ground();
+        draw_drone(drone_x, drone_y, prop_rot);
+
+        /* Push to display   SPI flush ~30 ms keeps frame rate natural */
+        lcd_flush();
+    }
+}
+
+/* ================================================================
+ * INTERRUPT HANDLERS
+ * ================================================================ */
+void EXTI9_5_IRQHandler(void) {
+    if (EXTI->PR & (1<<6)) { EXTI->PR=(1<<6); if(x>0) x--; update_led(); }
+    if (EXTI->PR & (1<<8)) { EXTI->PR=(1<<8); if(y<2) y++; update_led(); }
+}
+void EXTI4_IRQHandler(void) {
+    if (EXTI->PR & (1<<4)) { EXTI->PR=(1<<4); if(x<2) x++; update_led(); }
+}
+void EXTI0_IRQHandler(void) {
+    if (EXTI->PR & (1<<0)) { EXTI->PR=(1<<0); if(y>0) y--; update_led(); }
+}
+void EXTI15_10_IRQHandler(void) {
+    if (EXTI->PR&(1<<10)){ EXTI->PR=(1<<10); if(x>0&&y>0){x--;y--;} update_led(); }
+    if (EXTI->PR&(1<<11)){ EXTI->PR=(1<<11); if(x>0&&y<2){x--;y++;} update_led(); }
+    if (EXTI->PR&(1<<12)){ EXTI->PR=(1<<12); if(x<2&&y<2){x++;y++;} update_led(); }
+    if (EXTI->PR&(1<<13)){ EXTI->PR=(1<<13); if(x<2&&y>0){x++;y--;} update_led(); }
+}
+
+/* ================================================================
+ * TIM2 DELAY
+ * ================================================================ */
+void timer2_delay_ms(int ms) {
+    TIM2->PSC  = 16000-1;
+    TIM2->ARR  = ms-1;
+    TIM2->CNT  = 0;
+    TIM2->SR  &= ~0x01;
+    TIM2->EGR  = 0x01;
+    TIM2->SR  &= ~0x01;
+    TIM2->CR1 |=  0x01;
+    while (!(TIM2->SR & 0x01));
+    TIM2->SR  &= ~0x01;
+    TIM2->CR1 &= ~0x01;
+}
